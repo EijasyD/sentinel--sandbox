@@ -1,0 +1,13 @@
+{
+  "$schema": "https://example.org/sentinel.schema.json",
+  "version": "0.1.0",
+  "sentinels": [
+    {
+      "id": "hallucination-guard-v1",
+      "pattern": "uncited_fact|confident_uncertain|unsupported_claim",
+      "action": "block_or_request_cite",
+      "severity": "high",
+      "notes": "Requires >=1 anchor citation before allow."
+    }
+  ]
+}

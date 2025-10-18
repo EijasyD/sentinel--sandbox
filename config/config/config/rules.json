@@ -1,0 +1,18 @@
+{
+  "spike_config": {
+    "moe_top_k": 4,
+    "tau": 0.92,
+    "early_exit": true,
+    "quant": "FP4+adaptive",
+    "token_thinning": "v3.4"
+  },
+  "aeap": {
+    "max_safe_plus_plus": true,
+    "rollback_on_warn": true,
+    "promote_threshold": "3_of_3_green"
+  },
+  "telemetry": {
+    "emit_min": 5,
+    "jsonl_min": 3
+  }
+}

@@ -1,0 +1,7 @@
+moe_top_k: 4
+tau: 0.92
+early_exit: true
+precision: FP4+adaptive
+token_thinning: v3.4
+min_citations: 3
+cite_coverage_target: 0.995

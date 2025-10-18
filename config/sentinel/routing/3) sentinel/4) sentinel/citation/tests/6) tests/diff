@@ -1,0 +1,319 @@
+diff --git a/config/defaults.yaml b/config/defaults.yaml
+index 3b5a1a1..9f88b3a 100644
+--- a/config/defaults.yaml
++++ b/config/defaults.yaml
+@@ -1,8 +1,20 @@
+ inference:
+-  moe_top_k: 2
+-  tau: 1.0
+-  early_exit: false
++  moe_top_k: 4            # AEAP7.1 target
++  tau: 0.92               # temperature for routing softmax
++  early_exit: true        # enable consistent early-exit
++  token_thinning_version: "3.4"
++  stable_fp4_gating: true # opt-in, idempotent if absent
++  ucb_eps: 0.10           # ε-greedy/UCB blend for router
++
++sentinel:
++  cite_min: 3
++  cite_cov_target: 0.995  # warn if coverage falls below this
++
+ telemetry:
+   enable: true
+   p95_budget_ms: 300
++  track_dup_rate: true
++  track_cite_cov: true
++  track_exit_hits: true
++  track_tokens_per_resp: true
+
+diff --git a/sentinel/routing/gating.py b/sentinel/routing/gating.py
+index 4a12c77..d3e56e1 100644
+--- a/sentinel/routing/gating.py
++++ b/sentinel/routing/gating.py
+@@ -1,16 +1,104 @@
+-# existing simple top-k routing (kept for backward compatibility)
+-from torch import nn
+-import torch
++from torch import nn
++import torch
++
++# --- AEAP7.1 additions: FP4-stable gating + ε-UCB prior mix (idempotent) ---
++
++def _stable_softmax(logits: torch.Tensor, tau: float) -> torch.Tensor:
++    """
++    Numerically-stable softmax for low-precision (e.g., FP4) pipelines.
++    Subtract per-row max, clamp to [-12,12], then softmax at temperature tau.
++    """
++    if logits.dtype != torch.float32:
++        logits = logits.float()
++    m = logits.max(dim=-1, keepdim=True).values
++    z = (logits - m).clamp_(-12.0, 12.0)
++    return torch.softmax(z / tau, dim=-1)
++
++def _ucb_prior(counts: torch.Tensor, rewards: torch.Tensor, c: float = 1.5) -> torch.Tensor:
++    """
++    Build a probability prior over experts using UCB1 scores.
++    counts/rewards are EMA aggregates per expert (shape [E]).
++    """
++    E = counts.numel()
++    safe_counts = torch.clamp(counts, min=1.0)
++    N = safe_counts.sum()
++    bonus = c * torch.sqrt(torch.log(N + 1.0) / safe_counts)
++    scores = (rewards + bonus).clamp_min(0.0)
++    s = scores.sum()
++    if s <= 0:
++        return torch.full_like(scores, 1.0 / E)
++    return scores / s
++
++class RunningExpertStats(nn.Module):
++    """
++    Lightweight, optional state to track per-expert usage & reward.
++    Idempotent: if never provided/updated, router reduces to existing behavior.
++    """
++    def __init__(self, num_experts: int, ema: float = 0.9):
++        super().__init__()
++        self.register_buffer("counts", torch.ones(num_experts))
++        self.register_buffer("rewards", torch.zeros(num_experts))
++        self.ema = ema
++
++    @torch.no_grad()
++    def update(self, expert_idx: torch.Tensor, reward: torch.Tensor):
++        # expert_idx: [B, k], reward: [B] or [B, k] → reduce to per-expert sum
++        flat_idx = expert_idx.reshape(-1)
++        if reward.dim() > 1:
++            flat_reward = reward.reshape(-1)
++        else:
++            # broadcast each reward across its k experts
++            k = expert_idx.size(-1)
++            flat_reward = reward.repeat_interleave(k)
++        # counts (ema-like accumulation)
++        self.counts[flat_idx] = self.ema * self.counts[flat_idx] + (1.0 - self.ema) * (1.0)
++        # rewards (ema of observed reward proxy, e.g., token likelihood gain)
++        self.rewards[flat_idx] = self.ema * self.rewards[flat_idx] + (1.0 - self.ema) * flat_reward
++
++class StableTopKRouter(nn.Module):
++    """
++    Drop-in router that:
++      1) stabilizes gating for FP4 (clamp + stable softmax)
++      2) blends with a UCB prior distribution (ε mix) to reduce expert skew/dup
++    If disabled via config, existing router path remains unchanged.
++    """
++    def __init__(self, expert_proj: nn.Module, k: int = 4, tau: float = 0.92,
++                 ucb_eps: float = 0.10, expert_stats: RunningExpertStats | None = None):
++        super().__init__()
++        self.expert_proj = expert_proj
++        self.k = k
++        self.tau = tau
++        self.ucb_eps = ucb_eps
++        self.stats = expert_stats
++
++    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        # logits: [B, E]
++        logits = self.expert_proj(h)
++        probs = _stable_softmax(logits, tau=self.tau)  # FP4-friendly
++        if self.stats is not None and self.ucb_eps > 0.0:
++            prior = _ucb_prior(self.stats.counts, self.stats.rewards)  # [E]
++            probs = (1.0 - self.ucb_eps) * probs + self.ucb_eps * prior
++            probs = probs / probs.sum(dim=-1, keepdim=True)  # renorm
++        topv, topi = torch.topk(probs, k=self.k, dim=-1)  # [B, k]
++        return topi, topv
++
++# --- existing symbols below remain unchanged for backward compatibility ---
+
+ class TopKRouter(nn.Module):
+     def __init__(self, expert_proj: nn.Module, k: int = 2):
+         super().__init__()
+         self.expert_proj = expert_proj
+         self.k = k
+ 
+     def forward(self, h: torch.Tensor):
+-        logits = self.expert_proj(h)
+-        probs = torch.softmax(logits, dim=-1)
++        # legacy path (unchanged)
++        logits = self.expert_proj(h)
++        probs = torch.softmax(logits, dim=-1)
+         topv, topi = torch.topk(probs, k=self.k, dim=-1)
+         return topi, topv
++
++def make_router(expert_proj: nn.Module, cfg, stats: RunningExpertStats | None = None):
++    """
++    Factory: returns stable router when enabled, else legacy router.
++    """
++    use_stable = bool(getattr(cfg.inference, "stable_fp4_gating", False))
++    if use_stable:
++        return StableTopKRouter(
++            expert_proj=expert_proj,
++            k=getattr(cfg.inference, "moe_top_k", 4),
++            tau=getattr(cfg.inference, "tau", 0.92),
++            ucb_eps=getattr(cfg.inference, "ucb_eps", 0.10),
++            expert_stats=stats
++        )
++    return TopKRouter(expert_proj, k=getattr(cfg.inference, "moe_top_k", 2))
+ 
+diff --git a/sentinel/citation/guard.py b/sentinel/citation/guard.py
+new file mode 100644
+index 0000000..e1a2bcd
+--- /dev/null
++++ b/sentinel/citation/guard.py
+@@ -0,0 +1,76 @@
++import dataclasses
++from typing import Sequence
++
++@dataclasses.dataclass
++class CiteGuardConfig:
++    min_cites: int = 3
++    cov_target: float = 0.995  # warn threshold
++
++@dataclasses.dataclass
++class CiteStats:
++    seen: int = 0
++    covered: int = 0
++
++class CiteGuard:
++    """
++    Anchors-first citation floor & coverage tracker.
++    Idempotent: if not wired into your pipeline, no behavior changes elsewhere.
++    """
++    def __init__(self, cfg: CiteGuardConfig):
++        self.cfg = cfg
++        self.stats = CiteStats()
++
++    def ensure_min(self, cites: Sequence[str]) -> bool:
++        """
++        Returns True when min citations satisfied, else False (caller can re-route to retrieval).
++        """
++        self.stats.seen += 1
++        ok = len([c for c in (cites or []) if c]) >= self.cfg.min_cites
++        if ok:
++            self.stats.covered += 1
++        return ok
++
++    def coverage(self) -> float:
++        if self.stats.seen == 0:
++            return 1.0
++        return self.stats.covered / self.stats.seen
++
++    def warn_if_low(self) -> bool:
++        return self.coverage() < self.cfg.cov_target
++
+diff --git a/sentinel/early_exit.py b/sentinel/early_exit.py
+index 5c1d0a2..1c3b8b9 100644
+--- a/sentinel/early_exit.py
++++ b/sentinel/early_exit.py
+@@ -1,11 +1,66 @@
+ import torch
+ 
+-# legacy: simple entropy threshold (left unchanged)
++# legacy: simple entropy threshold (left unchanged)
+ def entropy_exit(prob, thresh: float = 0.05):
+     ent = -(prob * (prob + 1e-9).log()).sum(dim=-1)
+     return (ent < thresh)
+ 
++class MovingZCalibrator:
++    """
++    Consistent early-exit calibrator to prevent flip-flop under token thinning.
++    Uses moving mean/std of confidence deltas; exits when z < delta_z.
++    """
++    def __init__(self, window: int = 32, delta_z: float = -0.5):
++        self.window = window
++        self.delta_z = delta_z
++        self.buf = []
++
++    def should_exit(self, conf_now: torch.Tensor, conf_prev: torch.Tensor | None) -> bool:
++        # conf_*: scalar confidences (e.g., 1 - entropy)
++        if conf_prev is None:
++            return False
++        delta = (conf_now - conf_prev).item()
++        self.buf.append(delta)
++        if len(self.buf) > self.window:
++            self.buf.pop(0)
++        if len(self.buf) < 8:
++            return False
++        import statistics as stats
++        mu = stats.mean(self.buf)
++        sigma = max(stats.pstdev(self.buf), 1e-6)
++        z = (delta - mu) / sigma
++        return z < self.delta_z
++
++def make_exit_policy(cfg):
++    """
++    Factory: returns callable(policy) that combines legacy entropy check
++    with moving-z consistency gate when cfg.inference.early_exit is True.
++    """
++    if not getattr(cfg.inference, "early_exit", False):
++        return lambda prob, prev_conf=None: entropy_exit(prob)
++    calib = MovingZCalibrator()
++    def policy(prob, prev_conf=None):
++        ent = -(prob * (prob + 1e-9).log()).sum(dim=-1)
++        conf = 1.0 - ent.mean()  # batch scalar proxy
++        return calib.should_exit(torch.tensor(conf), None if prev_conf is None else torch.tensor(prev_conf))
++    return policy
++
+diff --git a/tests/test_router_fp4_stability.py b/tests/test_router_fp4_stability.py
+new file mode 100644
+index 0000000..3b12cde
+--- /dev/null
++++ b/tests/test_router_fp4_stability.py
+@@ -0,0 +1,65 @@
++import torch
++from torch import nn
++from sentinel.routing.gating import StableTopKRouter, RunningExpertStats
++
++class DummyProj(nn.Module):
++    def __init__(self, d_in=8, experts=16):
++        super().__init__()
++        self.lin = nn.Linear(d_in, experts, bias=False)
++        nn.init.uniform_(self.lin.weight, a=-0.01, b=0.01)
++    def forward(self, x): return self.lin(x)
++
++def test_shapes_and_probs_sum():
++    torch.manual_seed(0)
++    B, D, E, K = 4, 8, 16, 4
++    proj = DummyProj(D, E)
++    x = torch.randn(B, D).to(torch.float16)  # simulate low-precision activation
++    router = StableTopKRouter(proj, k=K, tau=0.92, ucb_eps=0.10)
++    idx, val = router(x)
++    assert idx.shape == (B, K)
++    assert val.shape == (B, K)
++    # ensure probabilities are in [0,1] and top-k sums <= 1
++    assert torch.all((val >= 0) & (val <= 1))
++    assert torch.all(val.sum(dim=-1) <= 1.0 + 1e-5)
++
++def test_ucb_mix_idempotent_without_stats():
++    B, D, E, K = 2, 8, 8, 4
++    proj = DummyProj(D, E)
++    x = torch.randn(B, D)
++    r1 = StableTopKRouter(proj, k=K, tau=0.92, ucb_eps=0.10, expert_stats=None)
++    idx1, val1 = r1(x)
++    # re-run: deterministic given same seed/weights → stable
++    idx2, val2 = r1(x)
++    assert torch.allclose(val1, val2, atol=1e-5)
++
++def test_stats_update_and_prior_changes_distribution():
++    B, D, E, K = 2, 8, 8, 4
++    proj = DummyProj(D, E)
++    x = torch.randn(B, D)
++    stats = RunningExpertStats(num_experts=E)
++    r = StableTopKRouter(proj, k=K, tau=0.92, ucb_eps=0.10, expert_stats=stats)
++    idx, val = r(x)
++    stats.update(idx, torch.ones(B, K))
++    idx2, val2 = r(x)
++    # distribution should shift slightly after rewards
++    assert not torch.allclose(val, val2)
++
+diff --git a/tests/test_citation_guard.py b/tests/test_citation_guard.py
+new file mode 100644
+index 0000000..f11aabc
+--- /dev/null
++++ b/tests/test_citation_guard.py
+@@ -0,0 +1,29 @@
++from sentinel.citation.guard import CiteGuard, CiteGuardConfig
++
++def test_min_cites_and_coverage():
++    g = CiteGuard(CiteGuardConfig(min_cites=3, cov_target=0.995))
++    assert g.ensure_min(["a","b","c"]) is True
++    assert g.ensure_min(["a"]) is False
++    cov = g.coverage()
++    assert 0.0 <= cov <= 1.0
++    # After 2 checks, 1 covered → 0.5 coverage; should warn (< 0.995)
++    assert g.warn_if_low() is True
